@@ -1,0 +1,109 @@
+name: "Clean up GitHub Container Registry"
+description: "Deletes old container packages from GitHub Container Registry based on a specified retention period"
+author: "@ilyashatalov"
+branding:
+  icon: "trash-2"
+  color: "blue"
+
+inputs:
+  token:
+    description: "GitHub token with appropriate permissions"
+    required: true
+    default: ${{ github.token }}
+  org:
+    description: "GitHub organization name (leave empty if using a user account)"
+    required: false
+    default: ""
+  username:
+    description: "GitHub username (leave empty if using an organization)"
+    required: false
+    default: ${{ github.repository_owner }}
+  package-name:
+    description: "Container package name (defaults to repository name)"
+    required: false
+    default: ""
+  days:
+    description: "Number of days to keep packages"
+    required: false
+    default: "30"
+  dry-run:
+    description: "If true, only list packages that would be deleted without actually deleting them"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set package variables
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.package-name }}" ]; then
+          # Extract the repository name from the full repository path
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d '/' -f 2)
+          echo "PACKAGE_NAME=$REPO_NAME" >> $GITHUB_ENV
+        else
+          echo "PACKAGE_NAME=${{ inputs.package-name }}" >> $GITHUB_ENV
+        fi
+
+        if [ -n "${{ inputs.org }}" ]; then
+          echo "OWNER_TYPE=orgs" >> $GITHUB_ENV
+          echo "OWNER_NAME=${{ inputs.org }}" >> $GITHUB_ENV
+        else
+          echo "OWNER_TYPE=users" >> $GITHUB_ENV
+          echo "OWNER_NAME=${{ inputs.username }}" >> $GITHUB_ENV
+        fi
+
+        echo "RETENTION_SECONDS=$((${{ inputs.days }} * 86400))" >> $GITHUB_ENV
+
+    - name: Install jq
+      shell: bash
+      run: |
+        if ! command -v jq &> /dev/null; then
+          echo "Installing jq..."
+          sudo apt-get update
+          sudo apt-get install -y jq
+        else
+          echo "jq is already installed"
+        fi
+
+    - name: List and delete old packages
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        echo "Fetching package versions for $OWNER_NAME/$PACKAGE_NAME"
+        API_PATH="/$OWNER_TYPE/$OWNER_NAME/packages/container/$PACKAGE_NAME/versions"
+
+        gh api -X GET "$API_PATH" \
+          --paginate \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" > versions.json
+
+        if [ ! -s versions.json ]; then
+          echo "No packages found or API returned empty response"
+          exit 0
+        fi
+
+        echo "Found packages:"
+        jq -r '.[] | [(.id | tostring), .updated_at, .metadata.container.tags[0] // "untagged"] | join(" - ")' versions.json
+
+        echo "Looking for packages older than ${{ inputs.days }} days..."
+        OLD_PACKAGES=$(jq -r ".[] | select((.updated_at | fromdateiso8601) < (now - $RETENTION_SECONDS)) | .id" versions.json)
+
+        if [ -z "$OLD_PACKAGES" ]; then
+          echo "No packages older than ${{ inputs.days }} days found"
+          exit 0
+        fi
+
+        echo "Packages to delete (older than ${{ inputs.days }} days):"
+        echo "$OLD_PACKAGES" | xargs -I{} jq -r ".[] | select(.id == {}) | [(.id | tostring), .updated_at, .metadata.container.tags[0] // \"untagged\"] | join(\" - \")" versions.json
+
+        if [ "${{ inputs.dry-run }}" = "true" ]; then
+          echo "DRY RUN: Would delete $(echo "$OLD_PACKAGES" | wc -l) packages"
+        else
+          echo "Deleting old packages..."
+          echo "$OLD_PACKAGES" | xargs -r -I{} gh api -X DELETE "$API_PATH/{}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN"
+          echo "Successfully deleted $(echo "$OLD_PACKAGES" | wc -l) old packages"
+        fi

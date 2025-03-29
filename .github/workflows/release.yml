@@ -1,0 +1,62 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Get previous tag
+        id: previoustag
+        run: |
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 ${{ steps.get_version.outputs.VERSION }}^ || echo "none")
+          echo "PREVIOUS_TAG=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          if [ "${{ steps.previoustag.outputs.PREVIOUS_TAG }}" != "none" ]; then
+            CHANGELOG=$(git log ${{ steps.previoustag.outputs.PREVIOUS_TAG }}..${{ steps.get_version.outputs.VERSION }} --pretty=format:"* %s (%h)" --reverse)
+          else
+            CHANGELOG=$(git log ${{ steps.get_version.outputs.VERSION }} --pretty=format:"* %s (%h)" --reverse)
+          fi
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.get_version.outputs.VERSION }}
+          release_name: Release ${{ steps.get_version.outputs.VERSION }}
+          body: |
+            ## Changes in this Release
+            
+            ${{ steps.changelog.outputs.CHANGELOG }}
+            
+            ## How to use this version
+            
+            ```yaml
+            - uses: 404cerebrum/cleanup-ghcr-packages@${{ steps.get_version.outputs.VERSION }}
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+            ```
+          draft: false
+          prerelease: false
