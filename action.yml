@@ -1,35 +1,35 @@
-name: "Clean up GitHub Container Registry"
-description: "Deletes old container packages from GitHub Container Registry based on a specified retention period"
-author: "@ilyashatalov"
+name: 'Clean up GitHub Container Registry'
+description: 'Deletes old container packages from GitHub Container Registry based on a specified retention period'
+author: '404cerebrum'
 branding:
-  icon: "trash-2"
-  color: "blue"
+  icon: 'trash-2'
+  color: 'blue'
 
 inputs:
   token:
-    description: "GitHub token with appropriate permissions"
+    description: 'GitHub token with appropriate permissions'
     required: true
     default: ${{ github.token }}
   org:
-    description: "GitHub organization name (leave empty if using a user account)"
+    description: 'GitHub organization name (leave empty if using a user account)'
     required: false
-    default: ""
+    default: ''
   username:
-    description: "GitHub username (leave empty if using an organization)"
+    description: 'GitHub username (leave empty if using an organization)'
     required: false
     default: ${{ github.repository_owner }}
   package-name:
-    description: "Container package name (defaults to repository name)"
+    description: 'Container package name (defaults to repository name)'
     required: false
-    default: ""
+    default: ''
   days:
-    description: "Number of days to keep packages"
+    description: 'Number of days to keep packages'
     required: false
-    default: "30"
+    default: '30'
   dry-run:
-    description: "If true, only list packages that would be deleted without actually deleting them"
+    description: 'If true, only list packages that would be deleted without actually deleting them'
     required: false
-    default: "false"
+    default: 'false'
 
 runs:
   using: "composite"
@@ -44,7 +44,7 @@ runs:
         else
           echo "PACKAGE_NAME=${{ inputs.package-name }}" >> $GITHUB_ENV
         fi
-
+        
         if [ -n "${{ inputs.org }}" ]; then
           echo "OWNER_TYPE=orgs" >> $GITHUB_ENV
           echo "OWNER_NAME=${{ inputs.org }}" >> $GITHUB_ENV
@@ -52,7 +52,7 @@ runs:
           echo "OWNER_TYPE=users" >> $GITHUB_ENV
           echo "OWNER_NAME=${{ inputs.username }}" >> $GITHUB_ENV
         fi
-
+        
         echo "RETENTION_SECONDS=$((${{ inputs.days }} * 86400))" >> $GITHUB_ENV
 
     - name: Install jq
@@ -73,37 +73,50 @@ runs:
       run: |
         echo "Fetching package versions for $OWNER_NAME/$PACKAGE_NAME"
         API_PATH="/$OWNER_TYPE/$OWNER_NAME/packages/container/$PACKAGE_NAME/versions"
-
+        
         gh api -X GET "$API_PATH" \
           --paginate \
           -H "Accept: application/vnd.github+json" \
           -H "Authorization: Bearer $GITHUB_TOKEN" > versions.json
-
+        
         if [ ! -s versions.json ]; then
           echo "No packages found or API returned empty response"
           exit 0
         fi
-
+        
         echo "Found packages:"
         jq -r '.[] | [(.id | tostring), .updated_at, .metadata.container.tags[0] // "untagged"] | join(" - ")' versions.json
-
+        
         echo "Looking for packages older than ${{ inputs.days }} days..."
         OLD_PACKAGES=$(jq -r ".[] | select((.updated_at | fromdateiso8601) < (now - $RETENTION_SECONDS)) | .id" versions.json)
-
+        
         if [ -z "$OLD_PACKAGES" ]; then
           echo "No packages older than ${{ inputs.days }} days found"
           exit 0
         fi
-
+        
         echo "Packages to delete (older than ${{ inputs.days }} days):"
         echo "$OLD_PACKAGES" | xargs -I{} jq -r ".[] | select(.id == {}) | [(.id | tostring), .updated_at, .metadata.container.tags[0] // \"untagged\"] | join(\" - \")" versions.json
-
+        
         if [ "${{ inputs.dry-run }}" = "true" ]; then
           echo "DRY RUN: Would delete $(echo "$OLD_PACKAGES" | wc -l) packages"
         else
           echo "Deleting old packages..."
-          echo "$OLD_PACKAGES" | xargs -r -I{} gh api -X DELETE "$API_PATH/{}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN"
-          echo "Successfully deleted $(echo "$OLD_PACKAGES" | wc -l) old packages"
+          # Store the count of packages to delete
+          DELETE_COUNT=$(echo "$OLD_PACKAGES" | wc -l)
+          
+          # Delete old packages and handle errors
+          for PKG_ID in $OLD_PACKAGES; do
+            echo "Deleting package ID: $PKG_ID"
+            RESULT=$(gh api -X DELETE "$API_PATH/$PKG_ID" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" 2>&1 || echo "ERROR: $?")
+            
+            if echo "$RESULT" | grep -q "ERROR\|400\|cannot be deleted"; then
+              echo "  ⚠️ Warning: Could not delete package $PKG_ID"
+              echo "  $RESULT"
+            fi
+          done
+          
+          echo "Successfully processed $DELETE_COUNT packages (some may have been skipped due to GitHub restrictions)"
         fi
