@@ -57,11 +57,12 @@ jobs:
       
       # Verify test image exists
       - name: Verify test image exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # List packages to verify our test package exists
           gh api -X GET /users/${{ github.actor }}/packages/container/${{ env.TEST_PACKAGE }}/versions \
-            --paginate -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" > all_versions.json
+            --paginate -H "Accept: application/vnd.github+json" > all_versions.json
             
           # Check if our test tag exists
           if jq -e '.[] | select(.metadata.container.tags[] | contains("${{ env.TEST_TAG }}"))' all_versions.json > /dev/null; then
@@ -92,12 +93,12 @@ jobs:
       
       # Get test package ID for verification
       - name: Get test package ID
-        id: get_test_package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Get specific test package details
           gh api -X GET /users/${{ github.actor }}/packages/container/${{ env.TEST_PACKAGE }}/versions \
-            --paginate -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" > versions.json
+            --paginate -H "Accept: application/vnd.github+json" > versions.json
             
           # Extract test package ID
           TEST_PACKAGE_ID=$(jq -r '.[] | select(.metadata.container.tags[] | contains("${{ env.TEST_TAG }}")) | .id' versions.json)
@@ -121,11 +122,12 @@ jobs:
       
       # Verify deletion
       - name: Verify test package was deleted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # List packages again to check if our test package was deleted
           gh api -X GET /users/${{ github.actor }}/packages/container/${{ env.TEST_PACKAGE }}/versions \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" > final_versions.json 2>/dev/null || echo "Package not found (expected)"
+            -H "Accept: application/vnd.github+json" > final_versions.json 2>/dev/null || echo "Package not found (expected)"
             
           # If the file exists and contains data, check for our package ID
           if [ -s final_versions.json ] && jq -e '.[] | select(.id == '"${{ env.TEST_PACKAGE_ID }}"')' final_versions.json > /dev/null 2>&1; then
