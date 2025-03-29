@@ -22,20 +22,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 0: Debug packages in registry
-      - name: List existing packages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Listing existing packages for user ${{ github.actor }}"
-          gh api -X GET /users/${{ github.actor }}/packages?package_type=container \
-            -H "Accept: application/vnd.github+json" | jq '.'
-          
-          echo "Listing existing packages for org (if applicable)"
-          gh api -X GET /orgs/${{ github.repository_owner }}/packages?package_type=container \
-            -H "Accept: application/vnd.github+json" | jq '.' || echo "Not an organization"
-
-      # Create a test package with a specific tag to test deletion
+      # Create a test package with a specific tag for testing
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -46,95 +33,92 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create test image
+      - name: Create test container in current package
         run: |
           # Create a simple test Dockerfile
           echo 'FROM alpine:latest
           RUN echo "This is a test container" > /test.txt
           CMD ["cat", "/test.txt"]' > Dockerfile
           
-          # Set test package name (using "test-package" to be unique)
-          TEST_PACKAGE="test-cleanup-$(date +%s)"
-          TEST_TAG="latest"
+          # Use current repository name as the package name
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d '/' -f 2)
+          TEST_TAG="test-$(date +%s)"
           
-          echo "Creating test package: ghcr.io/${{ github.repository_owner }}/$TEST_PACKAGE:$TEST_TAG"
+          echo "Creating test container: ghcr.io/${{ github.repository_owner }}/$REPO_NAME:$TEST_TAG"
           
           # Build and push a test image
           docker buildx build --push \
-            --tag ghcr.io/${{ github.repository_owner }}/$TEST_PACKAGE:$TEST_TAG \
+            --tag ghcr.io/${{ github.repository_owner }}/$REPO_NAME:$TEST_TAG \
             .
             
-          echo "TEST_PACKAGE=$TEST_PACKAGE" >> $GITHUB_ENV
+          echo "PACKAGE_NAME=$REPO_NAME" >> $GITHUB_ENV
           echo "TEST_TAG=$TEST_TAG" >> $GITHUB_ENV
           
           # Wait for package to be available in the registry
           echo "Waiting for package to be available in registry..."
           sleep 30
       
-      # Verify container was pushed
-      - name: Verify container was pushed
-        run: |
-          # List images to verify our test container was pushed
-          echo "Docker images:"
-          docker images | grep ${{ env.TEST_PACKAGE }} || echo "Test image not found locally"
-      
-      # Verify visibility in registry
-      - name: Verify package visibility
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # List all packages to see if our package is visible
-          echo "Checking package visibility in user's packages:"
-          gh api -X GET /users/${{ github.actor }}/packages?package_type=container \
-            -H "Accept: application/vnd.github+json" | jq '.[] | .name' || echo "API call failed"
-          
-          echo "Checking package visibility in organization's packages (if applicable):"
-          gh api -X GET /orgs/${{ github.repository_owner }}/packages?package_type=container \
-            -H "Accept: application/vnd.github+json" | jq '.[] | .name' || echo "API call failed or not an organization"
-          
-          echo "Direct package check:"
-          gh api -X GET /users/${{ github.actor }}/packages/container/${{ env.TEST_PACKAGE }} \
-            -H "Accept: application/vnd.github+json" || echo "Package not found in user's packages"
-          
-          gh api -X GET /orgs/${{ github.repository_owner }}/packages/container/${{ env.TEST_PACKAGE }} \
-            -H "Accept: application/vnd.github+json" || echo "Package not found in organization's packages"
-
-      # Test action with simulated test
+      # Test basic dry run
       - name: Test action with dry-run
         uses: ./
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
+          package-name: ${{ env.PACKAGE_NAME }}
           days: 30
           dry-run: 'true'
       
-      # Test action with a very old date to ensure it works even when there are no packages to delete
-      - name: Test action with unlikely to delete anything
+      # Create a very old-dated package version (for testing deletion)
+      - name: Create older-dated package version for deletion test
+        run: |
+          # Create a different Dockerfile
+          echo 'FROM alpine:latest
+          RUN echo "This is an older test container" > /test-old.txt
+          CMD ["cat", "/test-old.txt"]' > Dockerfile.old
+          
+          # Build and push with deletion test tag
+          DELETION_TAG="delete-me-$(date +%s)"
+          
+          docker buildx build --push \
+            --file Dockerfile.old \
+            --tag ghcr.io/${{ github.repository_owner }}/${{ env.PACKAGE_NAME }}:$DELETION_TAG \
+            .
+            
+          echo "DELETION_TAG=$DELETION_TAG" >> $GITHUB_ENV
+          
+          # Wait for package to be available
+          sleep 15
+          
+          echo "Created package for deletion test: $DELETION_TAG"
+      
+      # Delete the test tag with a 0-day retention
+      - name: Test deletion with 0-day retention
         uses: ./
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          username: ${{ github.actor }}
-          days: 0
-          dry-run: 'true'
+          username: ${{ github.repository_owner }}
+          package-name: ${{ env.PACKAGE_NAME }}
+          days: 0  # 0-day retention to delete everything
+          dry-run: 'false'
       
-      # Test with organization parameter if applicable
+      # Verify the action ran successfully
       - name: Test with organization parameter
         if: github.repository_owner != github.actor
         uses: ./
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           org: ${{ github.repository_owner }}
-          days: 14
+          package-name: ${{ env.PACKAGE_NAME }}
+          days: 30
           dry-run: 'true'
           
       # Final success message
       - name: Test summary
         run: |
-          echo "✅ All tests passed successfully"
+          echo "✅ All tests completed successfully"
           echo "The following tests were performed:"
-          echo "1. Checked existing packages in registry"
-          echo "2. Created test container in GHCR (attempted)"
-          echo "3. Verified visibility of packages"
-          echo "4. Tested action with dry-run"
-          echo "5. Tested action with a very short retention period"
-          echo "6. Tested with organization parameter (if applicable)"
+          echo "1. Created test container in the current package repository"
+          echo "2. Tested action with dry-run"
+          echo "3. Created a package version for deletion testing"
+          echo "4. Tested actual deletion with 0-day retention"
+          echo "5. Tested with organization parameter (if applicable)"
