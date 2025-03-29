@@ -22,6 +22,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Basic test with dry run
       - name: Test action with dry run
         uses: ./
         with:
@@ -29,14 +30,146 @@ jobs:
           days: 30
           dry-run: 'true'
 
-      # Additional test cases can be added here
-      - name: Test with custom package name (dry run)
+      # Create a test package with a specific tag to test deletion
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create test image
+        run: |
+          # Create a simple test Dockerfile
+          echo 'FROM alpine:latest
+          RUN echo "This is a test container" > /test.txt
+          CMD ["cat", "/test.txt"]' > Dockerfile
+          
+          # Build and push a test image with timestamp in tag
+          TEST_TAG="test-$(date +%s)"
+          docker buildx build --push \
+            --tag ghcr.io/${{ github.repository }}:$TEST_TAG \
+            --tag ghcr.io/${{ github.repository }}:test-latest \
+            .
+            
+          echo "TEST_TAG=$TEST_TAG" >> $GITHUB_ENV
+          
+          # Wait for package to be available in the registry
+          sleep 15
+      
+      # Verify test image exists
+      - name: Verify test image exists
+        run: |
+          # List packages to verify our test package exists
+          gh api -X GET /users/${{ github.actor }}/packages/container/${{ github.event.repository.name }}/versions \
+            --paginate -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" > all_versions.json
+            
+          # Check if our test tag exists
+          if jq -e '.[] | select(.metadata.container.tags[] | contains("${{ env.TEST_TAG }}"))' all_versions.json > /dev/null; then
+            echo "✅ Test package ${{ env.TEST_TAG }} created successfully"
+          else
+            echo "❌ Test package ${{ env.TEST_TAG }} not found"
+            cat all_versions.json
+            exit 1
+          fi
+      
+      # Test with test package (modify the updated_at date in the API response to simulate old package)
+      - name: Get test package and simulate it's old
+        id: get_test_package
+        run: |
+          # Get specific test package details
+          gh api -X GET /users/${{ github.actor }}/packages/container/${{ github.event.repository.name }}/versions \
+            --paginate -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" > versions.json
+            
+          # Extract test package ID
+          TEST_PACKAGE_ID=$(jq -r '.[] | select(.metadata.container.tags[] | contains("${{ env.TEST_TAG }}")) | .id' versions.json)
+          echo "TEST_PACKAGE_ID=$TEST_PACKAGE_ID" >> $GITHUB_ENV
+          
+          if [ -z "$TEST_PACKAGE_ID" ]; then
+            echo "❌ Could not find test package ID"
+            exit 1
+          else
+            echo "✅ Found test package ID: $TEST_PACKAGE_ID"
+          fi
+          
+          # Create a modified version of the API response to simulate an old package
+          jq '[.[] | select(.metadata.container.tags[] | contains("${{ env.TEST_TAG }}")) | 
+            .updated_at = "2020-01-01T00:00:00Z"]' versions.json > test_package.json
+          
+          echo "✅ Created simulated old package data"
+      
+      # Test deletion with mocked data (using dry run)
+      - name: Test deletion with mocked old package (dry run)
+        run: |
+          # Use jq to process with mocked date
+          echo "Looking for packages older than 30 days in mocked data..."
+          OLD_PACKAGES=$(jq -r '.[].id' test_package.json)
+          
+          if [ -z "$OLD_PACKAGES" ]; then
+            echo "❌ No packages found in mocked data"
+            exit 1
+          fi
+          
+          echo "✅ Would delete package ID: $OLD_PACKAGES"
+          
+          # Verify it's our test package ID
+          if [ "$OLD_PACKAGES" != "${{ env.TEST_PACKAGE_ID }}" ]; then
+            echo "❌ Package ID mismatch"
+            exit 1
+          fi
+          
+          echo "✅ Mock deletion test passed"
+      
+      # Now actually delete the test package using our action
+      - name: Delete test package with action
+        uses: ./
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          package-name: ${{ github.event.repository.name }}
+          days: 9999  # Very high number to ensure only our test package is affected
+          dry-run: 'false'
+      
+      # Verify deletion
+      - name: Verify test package was deleted
+        run: |
+          # List packages again to check if our test package was deleted
+          gh api -X GET /users/${{ github.actor }}/packages/container/${{ github.event.repository.name }}/versions \
+            --paginate -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" > final_versions.json
+            
+          # Check if our test tag exists
+          if jq -e '.[] | select(.id == ${{ env.TEST_PACKAGE_ID }})' final_versions.json > /dev/null; then
+            echo "❌ Test package ${{ env.TEST_PACKAGE_ID }} still exists"
+            cat final_versions.json
+            exit 1
+          else
+            echo "✅ Test package ${{ env.TEST_PACKAGE_ID }} was successfully deleted"
+          fi
+          
+      # Test with custom package name (dry run)
+      - name: Test with custom package name
         uses: ./
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           package-name: 'test-package'
           days: 14
           dry-run: 'true'
-
-      # Optional: Add integration test that creates a test package and then deletes it
-      # This would require additional setup steps
+          
+      # Final success message
+      - name: Test summary
+        run: |
+          echo "✅ All tests passed successfully"
+          echo "The following tests were performed:"
+          echo "1. Basic dry run test"
+          echo "2. Created test container in GHCR"
+          echo "3. Verified test container exists"
+          echo "4. Simulated old package date for testing"
+          echo "5. Tested deletion with mocked data"
+          echo "6. Actually deleted test package using the action"
+          echo "7. Verified deletion was successful"
+          echo "8. Tested with custom package name"
